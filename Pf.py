@@ -75,7 +75,7 @@ def start_tracking():
                 new_tracking_paths.append(tp)
                 
                 # draw green circles on top of the output image
-                cv2.circle(output_img, (x, y), 3, (0, 255, 0), -1)
+                cv2.circle(output_img, (int(x), int(y)), 3, (0, 255, 0), -1)
  
             tracking_paths = new_tracking_paths
             
@@ -89,7 +89,7 @@ def start_tracking():
             mask[:] = 255
             for x, y in [np.int32(tp[-1]) for tp in
             tracking_paths]:
-                cv2.circle(mask, (x, y), 6, 0, -1)
+                cv2.circle(mask, (int(x), int(y)), 6, 0, -1)
                 
             # Extract good features to track. You can learn more
             # about the parameters here: http://goo.gl/BI2Kml

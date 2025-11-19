@@ -35,7 +35,7 @@ class ExamMonitor:
         # selection & tracking (CAMShift)
         self.selection = None     # (x0,y0,x1,y1)
         self.drag_start = None
-        self.tracking_state = 0
+        self.tracking_state = 0   # 0 = no tracking / necesita selección, 1 = tracking activo
         self.track_window = None
         self.hist = None
 
@@ -51,7 +51,7 @@ class ExamMonitor:
         self.not_attention_time = 0.0
 
         # breakdown counters (seconds)
-        self.not_attention_breakdown = defaultdict(float)  # keys: 'left','right','up','down','no_face','window_mouse','window_keyboard'
+        self.not_attention_breakdown = defaultdict(float)  # 'left','right','up','down','no_face','window_mouse','window_keyboard','rostro_perdido'
         self._last_frame_time = None
 
         # window change tracking
@@ -69,23 +69,11 @@ class ExamMonitor:
         self.btn_color_idle = (50, 180, 50)
         self.btn_color_running = (200, 60, 60)
 
-        # umbrales de atencion (pixels)
+        # umbrales de atencion (fractions of frame)
         h, w = self.frame.shape[:2]
         self.center = (w // 2, h // 2)
-        # if face center farther than these fractions -> consider turned
         self.x_frac_thresh = 0.18
         self.y_frac_thresh = 0.16
-
-        # detector de rostros (Haar cascade) — robusto y ligero
-        haar = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        self.face_cascade = cv2.CascadeClassifier(haar)
-        if self.face_cascade.empty():
-            raise RuntimeError("No se pudo cargar el cascade de faces de OpenCV.")
-
-        # window name and callback
-        self.winname = "Monitor de examen"
-        cv2.namedWindow(self.winname)
-        cv2.setMouseCallback(self.winname, self.mouse_event)
 
         # lock
         self.lock = threading.Lock()
@@ -100,6 +88,17 @@ class ExamMonitor:
             except Exception:
                 self.last_active_window = None
 
+        # new metric: how many times tracking was lost (and required reselection)
+        self.rostro_perdido = 0
+
+        # heuristic thresholds for loss detection (backproject sum)
+        self.bp_loss_thresh = 800  # experiméntalo: valor bajo => se considera perdido
+
+        # window name and callback
+        self.winname = "Monitor de examen (CAMShift)"
+        cv2.namedWindow(self.winname)
+        cv2.setMouseCallback(self.winname, self.mouse_event)
+
     # -------------------------
     # Vigilantes de eventos 
     # -------------------------
@@ -108,14 +107,11 @@ class ExamMonitor:
             # keyboard listener: detect Alt+Tab, Win/Meta, or other combos
             def on_press(key):
                 try:
-                    # key could be e.g. Key.alt_l, Key.tab, Key.cmd, Key.cmd_r, Key.ctrl_l
                     kname = str(key)
                     if "Key.alt" in kname or "Key.tab" in kname or "Key.cmd" in kname or "Key.ctrl" in kname or "Key.windows" in kname:
-                        # mark as keyboard window change event
                         with self.lock:
                             if self.exam_running:
                                 self.window_change_events_keyboard += 1
-                                # count 1 second (heuristic) as not-attention
                                 self.not_attention_breakdown['cambio de ventana con teclado'] += 1.0
                 except Exception:
                     pass
@@ -124,7 +120,6 @@ class ExamMonitor:
                 if pressed:
                     with self.lock:
                         if self.exam_running:
-                            # heuristic: any global click might indicate window change
                             self.window_change_events_mouse += 1
                             self.not_attention_breakdown['cambio de ventana con mouse'] += 1.0
 
@@ -149,23 +144,30 @@ class ExamMonitor:
     # mouse UI callback
     # -------------------------
     def mouse_event(self, event, x, y, flags, param):
-        # scale incoming coordinates to window size (already scaled frames)
-        # handle selection for tracking (drag)
+        # only allow selection actions while the exam is running AND not currently tracking
+        # this enforces "select only after start" and avoids accidental overwrite while tracking.
         if event == cv2.EVENT_LBUTTONDOWN:
-            # check if clicked on Start/Stop button
             bx, by, bw, bh = self.btn_rect
+            # button toggle is always allowed (start/stop)
             if bx <= x <= bx + bw and by <= y <= by + bh:
-                # toggle exam
                 if not self.exam_running:
                     self.start_exam()
                 else:
                     self.stop_exam()
                 return
 
-            # else start selection (face ROI)
+            # if exam not running, ignore ROI selection (per requirement)
+            if not self.exam_running:
+                return
+
+            # if we are currently tracking, do not allow starting a new selection (unless lost)
+            if self.tracking_state == 1:
+                # ignore selection while tracking active
+                return
+
+            # start selection (allowed only when exam_running and tracking_state==0)
             self.drag_start = (x, y)
             self.selection = None
-            self.tracking_state = 0
 
         elif event == cv2.EVENT_MOUSEMOVE and self.drag_start:
             xo, yo = self.drag_start
@@ -179,17 +181,24 @@ class ExamMonitor:
 
         elif event == cv2.EVENT_LBUTTONUP:
             # finalize selection
-            self.drag_start = None
-            if self.selection is not None:
+            if not self.exam_running:
+                # ignore
+                self.drag_start = None
+                self.selection = None
+                return
+
+            if self.drag_start and self.selection is not None:
+                # commit selection -> start CAMShift tracking
                 self.tracking_state = 1
                 x0, y0, x1, y1 = self.selection
                 self.track_window = (x0, y0, x1 - x0, y1 - y0)
-                # compute histogram for CAMShift
                 hsv_roi = cv2.cvtColor(self.frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
                 mask_roi = cv2.inRange(hsv_roi, np.array((0., 30., 10.)), np.array((180., 255., 255.)))
                 hist = cv2.calcHist([hsv_roi], [0], mask_roi, [32], [0, 180])
                 cv2.normalize(hist, hist, 0, 255, cv2.NORM_MINMAX)
                 self.hist = hist.reshape(-1)
+            # reset drag
+            self.drag_start = None
 
     # -------------------------
     # Examen
@@ -205,11 +214,12 @@ class ExamMonitor:
             self.not_attention_breakdown = defaultdict(float)
             self.window_change_events_mouse = 0
             self.window_change_events_keyboard = 0
+            self.rostro_perdido = 0
+            self._last_frame_time = None
         print("[ExamMonitor] Examen iniciado el:", time.ctime(self.exam_start_time))
 
         # start listeners
         self.start_listeners()
-        # if available, refresh last active window
         if ACTIVE_WINDOW_AVAILABLE:
             try:
                 self.last_active_window = gw.getActiveWindowTitle()
@@ -228,12 +238,7 @@ class ExamMonitor:
     # Analisis de atención
     # -------------------------
     def analyze_attention(self, face_bbox):
-        """
-        face_bbox: (x,y,w,h) or None
-        returns: (is_attending:bool, reason:string or None)
-        """
         now = time.time()
-        # measure dt from last frame
         if self._last_frame_time is None:
             dt = 0.0
         else:
@@ -243,7 +248,6 @@ class ExamMonitor:
             return True, None, dt
 
         if face_bbox is None:
-            # No face detected => count as not-attention
             self.not_attention_breakdown['no hay rostro'] += dt
             self.not_attention_time += dt
             return False, 'no hay rostro', dt
@@ -252,7 +256,7 @@ class ExamMonitor:
         cx = x + w / 2.0
         cy = y + h / 2.0
 
-        # maintain smoothed center
+        # smooth
         self.prev_face_centers.append((cx, cy))
         avg_cx = np.mean([c[0] for c in self.prev_face_centers])
         avg_cy = np.mean([c[1] for c in self.prev_face_centers])
@@ -263,10 +267,9 @@ class ExamMonitor:
 
         # thresholds
         if abs(dx) <= self.x_frac_thresh and abs(dy) <= self.y_frac_thresh:
-            # attending
             self.attention_time += dt
             return True, None, dt
-        # else not attending: decide direction
+
         dir_label = None
         if dx < -self.x_frac_thresh:
             dir_label = 'viendo a la izquierda'
@@ -299,46 +302,64 @@ class ExamMonitor:
                 self.frame = cv2.resize(frame, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
                 vis = self.frame.copy()
 
-                # detect face if not tracking with CAMShift
+                # If tracking is active, do CAMShift
                 face_bbox = None
                 if self.tracking_state == 1 and self.hist is not None and self.track_window is not None:
-                    # CAMShift
                     hsv = cv2.cvtColor(self.frame, cv2.COLOR_BGR2HSV)
                     prob = cv2.calcBackProject([hsv], [0], self.hist, [0, 180], 1)
-                    # apply mask of valid colors
                     mask = cv2.inRange(hsv, np.array((0., 30., 10.)), np.array((180., 255., 255.)))
                     prob &= mask
-                    # camshift
-                    try:
-                        track_box, self.track_window = cv2.CamShift(prob, tuple(self.track_window), (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1))
-                        pts = cv2.boxPoints(track_box).astype(int)
-                        cv2.polylines(vis, [pts], True, (0, 255, 0), 2)
-                        # approximate face bbox
-                        x, y, w, h = self.track_window
-                        face_bbox = (int(x), int(y), int(w), int(h))
-                    except Exception:
-                        # fallback to detection
+
+                    # loss detection by low total backproject energy
+                    total_bp = int(np.sum(prob) / 255)  # roughly count of positive pixels
+                    if total_bp < self.bp_loss_thresh:
+                        # consider tracking lost
+                        with self.lock:
+                            if self.exam_running:
+                                self.rostro_perdido += 1
+                                self.not_attention_breakdown['rostro_perdido'] += 1.0  # heuristic: +1s not-attention
+                                self.not_attention_time += 1.0
                         self.tracking_state = 0
+                        self.hist = None
+                        self.track_window = None
+                        # mark message and ask user to reselect
+                        cv2.putText(vis, "Rostro perdido: reseleccione (arrastre)", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 128, 255), 2)
+                    else:
+                        # try CamShift
+                        try:
+                            term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1)
+                            track_box, self.track_window = cv2.CamShift(prob, tuple(self.track_window), term)
+                            pts = cv2.boxPoints(track_box).astype(int)
+                            cv2.polylines(vis, [pts], True, (0, 255, 0), 2)
+                            x, y, w, h = self.track_window
+                            face_bbox = (int(x), int(y), int(w), int(h))
+                        except Exception:
+                            # CamShift failed -> mark lost and require reselection
+                            with self.lock:
+                                if self.exam_running:
+                                    self.rostro_perdido += 1
+                                    self.not_attention_breakdown['rostro_perdido'] += 1.0
+                                    self.not_attention_time += 1.0
+                            self.tracking_state = 0
+                            self.hist = None
+                            self.track_window = None
+                            cv2.putText(vis, "Rostro perdido: reseleccione (arrastre)", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 128, 255), 2)
 
+                # If not tracking, show hint (and allow selection only when exam running)
                 if self.tracking_state == 0:
-                    gray = cv2.cvtColor(self.frame, cv2.COLOR_BGR2GRAY)
-                    faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
-                    if len(faces) > 0:
-                        # choose largest face
-                        faces = sorted(faces, key=lambda r: r[2] * r[3], reverse=True)
-                        (x, y, w, h) = faces[0]
-                        face_bbox = (int(x), int(y), int(w), int(h))
-                        cv2.rectangle(vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                    if self.exam_running:
+                        cv2.putText(vis, "Seleccione rostro (arrastre) para iniciar tracking", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+                    else:
+                        cv2.putText(vis, "Presione Start Exam para habilitar seleccion", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
 
-                # analyze attention if exam running
+                # analyze attention
                 attending, reason, dt = self.analyze_attention(face_bbox)
-                # draw small status text
-                status_text = "RUNNING" if self.exam_running else "IDLE"
-                # draw button
+
+                # UI: draw button
                 bx, by, bw, bh = self.btn_rect
                 color = self.btn_color_running if self.exam_running else self.btn_color_idle
                 cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), color, -1)
-                label = "Stop Exam" if self.exam_running else "Start Exam"
+                label = "Detener Examen" if self.exam_running else "Iniciar Examen"
                 cv2.putText(vis, label, (bx + 8, by + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
                 # draw timer if running
@@ -348,23 +369,22 @@ class ExamMonitor:
                     mins = int(remaining // 60)
                     secs = int(remaining % 60)
                     cv2.putText(vis, f"Time left: {mins:02d}:{secs:02d}", (bx + bw + 10, by + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    # check for end of exam
                     if elapsed >= self.exam_duration_sec:
                         self.stop_exam()
 
-                # draw attention indicator
+                # draw attention indicator and lost counter
                 if self.exam_running:
                     if attending:
                         cv2.putText(vis, "Poniendo atencion", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 240, 0), 2)
                     else:
                         cv2.putText(vis, f"No pone atencion: {reason}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.putText(vis, f"Rostros perdidos: {self.rostro_perdido}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
 
                 # optionally draw current active window title
                 if ACTIVE_WINDOW_AVAILABLE:
                     try:
                         cur = gw.getActiveWindowTitle()
                         cv2.putText(vis, f"Ventana activa: {cur[:40]}", (10, vis.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-                        # if changed and exam running, count
                         with self.lock:
                             if self.exam_running and self.last_active_window is not None and cur != self.last_active_window:
                                 self.not_attention_breakdown['window_keyboard'] += 1.0
@@ -377,21 +397,18 @@ class ExamMonitor:
                 cv2.imshow(self.winname, vis)
                 self.total_frames += 1
 
-                # handle keys: ESC to quit, S to start/stop (alternative)
+                # keys: ESC quit, s toggle start/stop
                 key = cv2.waitKey(5) & 0xFF
                 if key == 27:
-                    # exit app (stop exam if running)
                     if self.exam_running:
                         self.stop_exam()
                     break
                 if key == ord('s'):
-                    # quick toggle
                     if self.exam_running:
                         self.stop_exam()
                     else:
                         self.start_exam()
 
-            # end while
         finally:
             self.cleanup()
 
@@ -411,7 +428,7 @@ class ExamMonitor:
         pct_not = (not_attend / duration * 100) if duration > 0 else 0.0
 
         print("\n===== REPORTE TOTAL =====")
-        print(f"Duracin: {duration:.1f} s")
+        print(f"Duracion: {duration:.1f} s")
         print(f"Tiempo total de atencion al examen: {attend:.1f} s")
         print(f"Tiempo sin poner atencion: {not_attend:.1f} s ({pct_not:.1f}%)")
         print("Resumen (en segundos):")
@@ -419,8 +436,9 @@ class ExamMonitor:
             print(f"  {k}: {v:.1f}s")
         print(f"Eventos de cambio de ventana (mouse): {self.window_change_events_mouse}")
         print(f"Eventos de cambio de ventana (teclado): {self.window_change_events_keyboard}")
+        print(f"Veces que se perdio el rostro (reselección requerida): {self.rostro_perdido}")
         suspicious = pct_not > 40.0
-        print(f"El comportamiento es sospechoso?? (>40% del tiempo sin poner atención): {suspicious}")
+        print(f"El comportamiento es sospechoso?? (>40% del tiempo sin poner atencion): {suspicious}")
         print("=======================\n")
 
 

@@ -80,6 +80,7 @@ class ExamMonitor:
 
         # for smoothing face location over a few frames
         self.prev_face_centers = deque(maxlen=5)
+        self.wlist = [""]
 
         # prepare active window name if available
         if ACTIVE_WINDOW_AVAILABLE:
@@ -389,6 +390,7 @@ class ExamMonitor:
                             if self.exam_running and self.last_active_window is not None and cur != self.last_active_window:
                                 self.not_attention_breakdown['window_keyboard'] += 1.0
                                 self.window_change_events_keyboard += 1
+                                self.wlist.append(cur)
                             self.last_active_window = cur
                     except Exception:
                         pass
@@ -434,6 +436,10 @@ class ExamMonitor:
         print("Resumen (en segundos):")
         for k, v in dict(self.not_attention_breakdown).items():
             print(f"  {k}: {v:.1f}s")
+        print(f"Ultima ventana activa al iniciar el examen: {self.last_active_window}")
+        print("Ventanas activadas durante el examen:")
+        for w in sorted(set(self.wlist)):
+            print(f"  {w}")
         print(f"Eventos de cambio de ventana (mouse): {self.window_change_events_mouse}")
         print(f"Eventos de cambio de ventana (teclado): {self.window_change_events_keyboard}")
         print(f"Veces que se perdio el rostro (reselección requerida): {self.rostro_perdido}")
